@@ -90,16 +90,40 @@ fi
 # Extract the most recent assistant text block.
 #
 # Claude Code writes each content block (text/tool_use/thinking) as its own
-# JSONL line, all with role=assistant. `tail -1` alone would often grab a
-# tool_use or thinking block, leaving no text to check. Instead, slurp all
-# assistant lines, flatten to text blocks only, and take the last one.
+# JSONL line, all with role=assistant. So slurp the last N assistant lines,
+# flatten to text blocks only, and take the last one.
 #
+# Capped at the last 100 assistant lines to keep jq's slurp input bounded
+# for long-running sessions.
+LAST_LINES=$(grep '"role":"assistant"' "$TRANSCRIPT_PATH" | tail -n 100)
+if [[ -z "$LAST_LINES" ]]; then
+  echo "⚠️  Ralph loop: Failed to extract assistant messages" >&2
+  echo "   Ralph loop is stopping." >&2
+  rm "$RALPH_STATE_FILE"
+  exit 0
+fi
+
+# Parse the recent lines and pull out the final text block.
 # `last // ""` yields empty string when no text blocks exist (e.g. a turn
 # that is all tool calls). That's fine: empty text means no <promise> tag,
 # so the loop simply continues.
-LAST_OUTPUT=$(grep '"role":"assistant"' "$TRANSCRIPT_PATH" | jq -rs '
+# (Briefly disable errexit so a jq failure can be caught by the $? check.)
+set +e
+LAST_OUTPUT=$(echo "$LAST_LINES" | jq -rs '
   map(.message.content[]? | select(.type == "text") | .text) | last // ""
-' 2>/dev/null) || LAST_OUTPUT=""
+' 2>&1)
+JQ_EXIT=$?
+set -e
+
+# Check if jq succeeded
+if [[ $JQ_EXIT -ne 0 ]]; then
+  echo "⚠️  Ralph loop: Failed to parse assistant message JSON" >&2
+  echo "   Error: $LAST_OUTPUT" >&2
+  echo "   This may indicate a transcript format issue." >&2
+  echo "   Ralph loop is stopping." >&2
+  rm "$RALPH_STATE_FILE"
+  exit 0
+fi
 
 # Check for completion promise (only if set)
 if [[ "$COMPLETION_PROMISE" != "null" ]] && [[ -n "$COMPLETION_PROMISE" ]]; then
